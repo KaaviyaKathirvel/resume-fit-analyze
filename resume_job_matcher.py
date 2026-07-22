@@ -14,6 +14,21 @@ st.markdown(
     "and suggests concrete resume tweaks."
 )
 
+with st.expander("ℹ️ What you'll need before you start", expanded=True):
+    st.markdown(
+        """
+- **Your own OpenAI API key**, with billing enabled on your OpenAI account.
+  Get one at [platform.openai.com/account/api-keys](https://platform.openai.com/account/api-keys) —
+  paste it in the sidebar, it's never stored or shared.
+- **A small amount of OpenAI credit.** Usage is billed to *your* OpenAI account,
+  not this app — typically just **a cent or two per job analyzed**, so $5 goes a long way.
+- **A PDF or pasted text of your resume**, plus one or more job descriptions to compare it against.
+
+**Having trouble uploading a PDF?** Some browser ad blockers or privacy extensions
+block the upload. Try an **incognito/private window**, or switch to **"Paste text"** instead.
+        """
+    )
+
 # ---------------------------------------------------------------------------
 # Sidebar: API key
 # ---------------------------------------------------------------------------
