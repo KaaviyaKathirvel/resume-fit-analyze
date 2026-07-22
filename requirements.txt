@@ -3,3 +3,5 @@ openai
 pandas
 plotly
 pypdf
+scikit-learn
+wordcloud

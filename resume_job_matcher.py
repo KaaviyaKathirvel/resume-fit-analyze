@@ -3,8 +3,12 @@ from openai import OpenAI
 import pandas as pd
 import plotly.express as px
 import json
+import re
 from pypdf import PdfReader
 import io
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from wordcloud import WordCloud
 
 st.set_page_config(page_title="Resume ↔ Job Fit Analyzer", page_icon="🎯", layout="wide")
 st.title("🎯 Resume ↔ Job Description Fit Analyzer")
@@ -105,6 +109,81 @@ JOB DESCRIPTION:
 
 
 # ---------------------------------------------------------------------------
+# Free helpers (no OpenAI calls — run entirely locally, no cost)
+# ---------------------------------------------------------------------------
+def compute_keyword_score(resume_text: str, job_text: str) -> float:
+    """
+    Rough, free fit estimate using TF-IDF cosine similarity between the
+    resume and job description. Not as nuanced as the AI analysis, but
+    costs nothing to run.
+    """
+    if not resume_text.strip() or not job_text.strip():
+        return 0.0
+    vectorizer = TfidfVectorizer(stop_words="english")
+    tfidf = vectorizer.fit_transform([resume_text, job_text])
+    score = cosine_similarity(tfidf[0:1], tfidf[1:2])[0][0]
+    return round(score * 100, 1)
+
+
+def generate_wordcloud_image(text: str):
+    """Generate a word cloud image (PIL Image) from job description text."""
+    wc = WordCloud(
+        width=900,
+        height=400,
+        background_color="white",
+        colormap="viridis",
+        stopwords=None,
+    ).generate(text)
+    return wc.to_image()
+
+
+def run_ats_checklist(resume_text: str) -> list:
+    """
+    Simple rule-based checks for common ATS-friendliness and completeness
+    issues. Purely local — no API calls.
+    """
+    checks = []
+
+    word_count = len(resume_text.split())
+    checks.append((
+        "Reasonable length",
+        200 <= word_count <= 1000,
+        f"{word_count} words (ideal range: roughly 200–1000)",
+    ))
+
+    has_email = bool(re.search(r"[\w.\-]+@[\w.\-]+\.\w+", resume_text))
+    checks.append((
+        "Contains an email address",
+        has_email,
+        "Found" if has_email else "Not found — make sure contact info is included",
+    ))
+
+    has_phone = bool(re.search(r"(\+?\d[\d\-\s().]{8,}\d)", resume_text))
+    checks.append((
+        "Contains a phone number",
+        has_phone,
+        "Found" if has_phone else "Not found — consider adding one",
+    ))
+
+    section_keywords = ["experience", "education", "skills"]
+    found_sections = [s for s in section_keywords if s in resume_text.lower()]
+    checks.append((
+        "Has standard sections (Experience / Education / Skills)",
+        len(found_sections) >= 2,
+        f"Found: {', '.join(found_sections) if found_sections else 'none detected'}",
+    ))
+
+    has_bullets = ("•" in resume_text) or bool(re.search(r"^\s*[-*]\s", resume_text, re.MULTILINE))
+    checks.append((
+        "Uses bullet points",
+        has_bullets,
+        "Found" if has_bullets else "Consider using bullet points — many ATS and recruiters scan for them",
+    ))
+
+    return checks
+
+
+# ---------------------------------------------------------------------------
 # Resume input
 # ---------------------------------------------------------------------------
 st.header("1. Your resume")
@@ -165,74 +244,149 @@ with col_remove:
         st.rerun()
 
 # ---------------------------------------------------------------------------
-# Run analysis
+# Analysis: AI-powered (costs OpenAI credit) vs Free tools (no cost)
 # ---------------------------------------------------------------------------
 st.header("3. Analysis")
 
-if st.button("🚀 Analyze fit", type="primary"):
-    if not openai_api_key:
-        st.error("Please enter your OpenAI API key in the sidebar.")
-    elif not resume_text.strip():
-        st.error("Please provide your resume (upload a PDF or paste text).")
-    elif not any(job["description"].strip() for job in st.session_state.jobs):
-        st.error("Please paste at least one job description.")
+tab_ai, tab_free = st.tabs([
+    "🤖 AI-Powered Analysis (uses OpenAI credit)",
+    "🆓 Free Tools (no cost, no API key needed)",
+])
+
+# --- Tab 1: AI-powered analysis --------------------------------------------
+with tab_ai:
+    st.caption(
+        "Sends your resume and job description(s) to OpenAI's API. "
+        "Costs a small amount of your own OpenAI credit — typically a cent or two per job."
+    )
+
+    if st.button("🚀 Analyze fit", type="primary"):
+        if not openai_api_key:
+            st.error("Please enter your OpenAI API key in the sidebar.")
+        elif not resume_text.strip():
+            st.error("Please provide your resume (upload a PDF or paste text).")
+        elif not any(job["description"].strip() for job in st.session_state.jobs):
+            st.error("Please paste at least one job description.")
+        else:
+            results = []
+            progress = st.progress(0, text="Analyzing jobs...")
+            valid_jobs = [j for j in st.session_state.jobs if j["description"].strip()]
+
+            for idx, job in enumerate(valid_jobs):
+                title = job["title"].strip() or f"Job {idx + 1}"
+                result = analyze_fit(resume_text, title, job["description"])
+                results.append(result)
+                progress.progress((idx + 1) / len(valid_jobs), text=f"Analyzed {title}")
+
+            progress.empty()
+            st.session_state.results = results
+
+    if "results" in st.session_state and st.session_state.results:
+        results = st.session_state.results
+        df = pd.DataFrame(results)
+
+        st.subheader("Fit score by job")
+        fig = px.bar(
+            df,
+            x="job_title",
+            y="fit_score",
+            color="fit_score",
+            color_continuous_scale="RdYlGn",
+            range_color=[1, 10],
+            labels={"job_title": "Job", "fit_score": "Fit score (1-10)"},
+            text="fit_score",
+        )
+        fig.update_layout(yaxis_range=[0, 10], coloraxis_showscale=False)
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("Details per job")
+        for result in results:
+            score = result.get("fit_score")
+            with st.expander(f"**{result['job_title']}** — Fit score: {score}/10"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("**✅ Matching skills**")
+                    for skill in result.get("matching_skills", []):
+                        st.markdown(f"- {skill}")
+                with col2:
+                    st.markdown("**⚠️ Missing / gap areas**")
+                    for skill in result.get("missing_skills", []):
+                        st.markdown(f"- {skill}")
+
+                st.markdown("**✏️ Suggested resume tweaks**")
+                for tweak in result.get("suggested_tweaks", []):
+                    st.markdown(f"- {tweak}")
+
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download results as CSV",
+            data=csv,
+            file_name="resume_job_fit_results.csv",
+            mime="text/csv",
+        )
+
+# --- Tab 2: Free tools (no OpenAI calls, no cost) ---------------------------
+with tab_free:
+    st.caption(
+        "These tools run entirely on your machine — no OpenAI API key or credit required. "
+        "The keyword match score is a rough heuristic, not as nuanced as the AI analysis."
+    )
+
+    valid_jobs = [j for j in st.session_state.jobs if j["description"].strip()]
+
+    # --- Free keyword match score ---
+    st.subheader("🔑 Keyword match score")
+    if st.button("Compute keyword match score"):
+        if not resume_text.strip():
+            st.error("Please provide your resume above first.")
+        elif not valid_jobs:
+            st.error("Please paste at least one job description above first.")
+        else:
+            free_results = []
+            for idx, job in enumerate(valid_jobs):
+                title = job["title"].strip() or f"Job {idx + 1}"
+                score = compute_keyword_score(resume_text, job["description"])
+                free_results.append({"job_title": title, "keyword_score": score})
+            st.session_state.free_results = free_results
+
+    if "free_results" in st.session_state and st.session_state.free_results:
+        free_df = pd.DataFrame(st.session_state.free_results)
+        fig_free = px.bar(
+            free_df,
+            x="job_title",
+            y="keyword_score",
+            color="keyword_score",
+            color_continuous_scale="Blues",
+            range_color=[0, 100],
+            labels={"job_title": "Job", "keyword_score": "Keyword match (%)"},
+            text="keyword_score",
+        )
+        fig_free.update_layout(yaxis_range=[0, 100], coloraxis_showscale=False)
+        st.plotly_chart(fig_free, use_container_width=True)
+
+    st.divider()
+
+    # --- Free job description word cloud ---
+    st.subheader("☁️ Job description keyword cloud")
+    if valid_jobs:
+        job_titles = [j["title"].strip() or f"Job {i + 1}" for i, j in enumerate(valid_jobs)]
+        selected_title = st.selectbox("Pick a job to visualize", job_titles)
+        if st.button("Generate word cloud"):
+            selected_job = valid_jobs[job_titles.index(selected_title)]
+            image = generate_wordcloud_image(selected_job["description"])
+            st.image(image, use_container_width=True)
     else:
-        results = []
-        progress = st.progress(0, text="Analyzing jobs...")
-        valid_jobs = [j for j in st.session_state.jobs if j["description"].strip()]
+        st.info("Paste at least one job description above to generate a word cloud.")
 
-        for idx, job in enumerate(valid_jobs):
-            title = job["title"].strip() or f"Job {idx + 1}"
-            result = analyze_fit(resume_text, title, job["description"])
-            results.append(result)
-            progress.progress((idx + 1) / len(valid_jobs), text=f"Analyzed {title}")
+    st.divider()
 
-        progress.empty()
-        st.session_state.results = results
-
-# ---------------------------------------------------------------------------
-# Display results
-# ---------------------------------------------------------------------------
-if "results" in st.session_state and st.session_state.results:
-    results = st.session_state.results
-    df = pd.DataFrame(results)
-
-    st.subheader("Fit score by job")
-    fig = px.bar(
-        df,
-        x="job_title",
-        y="fit_score",
-        color="fit_score",
-        color_continuous_scale="RdYlGn",
-        range_color=[1, 10],
-        labels={"job_title": "Job", "fit_score": "Fit score (1-10)"},
-        text="fit_score",
-    )
-    fig.update_layout(yaxis_range=[0, 10], coloraxis_showscale=False)
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.subheader("Details per job")
-    for result in results:
-        score = result.get("fit_score")
-        with st.expander(f"**{result['job_title']}** — Fit score: {score}/10"):
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("**✅ Matching skills**")
-                for skill in result.get("matching_skills", []):
-                    st.markdown(f"- {skill}")
-            with col2:
-                st.markdown("**⚠️ Missing / gap areas**")
-                for skill in result.get("missing_skills", []):
-                    st.markdown(f"- {skill}")
-
-            st.markdown("**✏️ Suggested resume tweaks**")
-            for tweak in result.get("suggested_tweaks", []):
-                st.markdown(f"- {tweak}")
-
-    csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download results as CSV",
-        data=csv,
-        file_name="resume_job_fit_results.csv",
-        mime="text/csv",
-    )
+    # --- Free ATS checklist ---
+    st.subheader("✅ Resume ATS checklist")
+    if st.button("Run ATS checklist"):
+        if not resume_text.strip():
+            st.error("Please provide your resume above first.")
+        else:
+            checklist = run_ats_checklist(resume_text)
+            for label, passed, detail in checklist:
+                icon = "✅" if passed else "⚠️"
+                st.markdown(f"{icon} **{label}** — {detail}")
