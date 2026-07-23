@@ -108,6 +108,62 @@ JOB DESCRIPTION:
     return parsed
 
 
+def rewrite_bullet(bullet_text: str, job_title: str, job_description: str) -> dict:
+    """
+    Ask the LLM to rewrite a single resume bullet point so it's more
+    relevant to a specific job. Returns a structured JSON result: a list of
+    1-2 rewrites, each with a short note on what changed and why.
+    """
+    client = OpenAI(api_key=openai_api_key)
+
+    system_instructions = (
+        "You are a helpful, precise career coach and technical recruiter. "
+        "You always respond with a single valid JSON object and nothing else - "
+        "no markdown fences, no commentary."
+    )
+
+    prompt = f"""
+Rewrite the RESUME BULLET below so it is more relevant and compelling for the JOB DESCRIPTION below.
+
+Return ONLY a JSON object with exactly this key:
+- "rewrites": a list of 1-2 objects, each with:
+    - "rewrite": a single rewritten version of the bullet — one line, led with a strong action verb, quantified where reasonable, and tailored to this job. Do not invent facts not implied by the original bullet.
+    - "note": a short one-line explanation of what changed and why it's a better fit for this specific job
+
+RESUME BULLET:
+{bullet_text}
+
+JOB DESCRIPTION:
+{job_description}
+"""
+
+    response = client.responses.create(
+        model="gpt-4o",
+        instructions=system_instructions,
+        input=prompt,
+    )
+
+    raw = response.output_text.strip()
+    # Defensive cleanup in case the model wraps the JSON in code fences anyway
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = {
+            "rewrites": [
+                {"rewrite": raw[:300], "note": "Could not parse model response as JSON."}
+            ],
+        }
+
+    parsed["job_title"] = job_title
+    return parsed
+
+
 # ---------------------------------------------------------------------------
 # Free helpers (no OpenAI calls — run entirely locally, no cost)
 # ---------------------------------------------------------------------------
@@ -248,9 +304,10 @@ with col_remove:
 # ---------------------------------------------------------------------------
 st.header("3. Analysis")
 
-tab_ai, tab_free = st.tabs([
+tab_ai, tab_free, tab_rewrite = st.tabs([
     "🤖 AI-Powered Analysis (uses OpenAI credit)",
     "🆓 Free Tools (no cost, no API key needed)",
+    "✏️ Rewrite a Bullet Point",
 ])
 
 # --- Tab 1: AI-powered analysis --------------------------------------------
@@ -390,3 +447,74 @@ with tab_free:
             for label, passed, detail in checklist:
                 icon = "✅" if passed else "⚠️"
                 st.markdown(f"{icon} **{label}** — {detail}")
+
+# --- Tab 3: Rewrite a bullet point (costs OpenAI credit) --------------------
+with tab_rewrite:
+    st.caption(
+        "Rewrites a single resume bullet to better target a specific job. "
+        "Sends it to OpenAI's API — costs a small amount of your own OpenAI "
+        "credit, same as the AI-Powered Analysis tab."
+    )
+
+    bullet_text = st.text_area(
+        "Paste one resume bullet point to rewrite",
+        key="rewrite_bullet_input",
+        height=100,
+        placeholder="e.g. Built internal dashboards for the sales team using SQL and Excel",
+    )
+
+    valid_jobs = [j for j in st.session_state.jobs if j["description"].strip()]
+
+    # Pick the target job: reuse a job entered above, or paste one directly.
+    PASTE_OPTION = "✏️ Paste a different job description"
+    target_description = ""
+    target_title = "Target job"
+
+    if valid_jobs:
+        job_titles = [j["title"].strip() or f"Job {i + 1}" for i, j in enumerate(valid_jobs)]
+        choice = st.selectbox(
+            "Which job should this bullet target?",
+            job_titles + [PASTE_OPTION],
+            key="rewrite_job_choice",
+        )
+        if choice == PASTE_OPTION:
+            target_description = st.text_area(
+                "Paste the target job description",
+                key="rewrite_job_paste",
+                height=150,
+            )
+        else:
+            selected_job = valid_jobs[job_titles.index(choice)]
+            target_title = choice
+            target_description = selected_job["description"]
+    else:
+        st.info("No job descriptions entered above — paste one here to target it.")
+        target_description = st.text_area(
+            "Paste the target job description",
+            key="rewrite_job_paste",
+            height=150,
+        )
+
+    if st.button("✏️ Rewrite bullet point", type="primary"):
+        if not openai_api_key:
+            st.error("Please enter your OpenAI API key in the sidebar.")
+        elif not bullet_text.strip():
+            st.error("Please paste a resume bullet point to rewrite.")
+        elif not target_description.strip():
+            st.error("Please pick or paste a target job description.")
+        else:
+            with st.spinner("Rewriting your bullet point..."):
+                st.session_state.rewrite_result = rewrite_bullet(
+                    bullet_text, target_title, target_description
+                )
+
+    if "rewrite_result" in st.session_state and st.session_state.rewrite_result:
+        result = st.session_state.rewrite_result
+        st.subheader(f"Suggested rewrites — targeting {result.get('job_title', 'the job')}")
+        for idx, item in enumerate(result.get("rewrites", []), start=1):
+            st.markdown(f"**Version {idx}**")
+            st.markdown(f"> {item.get('rewrite', '')}")
+            note = item.get("note")
+            if note:
+                st.caption(f"💡 What changed: {note}")
+            st.divider()
