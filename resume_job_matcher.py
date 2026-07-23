@@ -1,5 +1,6 @@
 import streamlit as st
-from openai import OpenAI
+import requests
+import os
 import pandas as pd
 import plotly.express as px
 import json
@@ -9,6 +10,9 @@ import io
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from wordcloud import WordCloud
+
+# Backend that owns the OpenAI calls. Configurable via env var; defaults to local.
+BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
 
 st.set_page_config(page_title="Resume ↔ Job Fit Analyzer", page_icon="🎯", layout="wide")
 st.title("🎯 Resume ↔ Job Description Fit Analyzer")
@@ -46,119 +50,131 @@ openai_api_key = st.sidebar.text_input(
 # Helpers
 # ---------------------------------------------------------------------------
 def extract_text_from_pdf(file) -> str:
+    """Extract text from an uploaded PDF file.
+
+    Args:
+        file: A file-like object (e.g. a Streamlit ``UploadedFile``)
+            containing PDF bytes.
+
+    Returns:
+        The concatenated text of all pages, joined by newlines.
+    """
     reader = PdfReader(io.BytesIO(file.read()))
     return "\n".join(page.extract_text() or "" for page in reader.pages)
 
 
 def analyze_fit(resume_text: str, job_title: str, job_description: str) -> dict:
+    """Compare a resume against a single job description via the backend.
+
+    Posts a one-element jobs list to ``POST /analyze-fit`` and unwraps
+    ``results[0]`` so the calling UI keeps working unchanged. On connection
+    or HTTP errors, surfaces the problem via ``st.error`` and returns a
+    same-shaped fallback dict.
+
+    Args:
+        resume_text: The full resume text.
+        job_title: Label for the target job.
+        job_description: The target job description.
+
+    Returns:
+        A dict with ``fit_score``, ``matching_skills``, ``missing_skills``,
+        ``suggested_tweaks``, and ``job_title``.
     """
-    Ask the LLM to compare a resume against a single job description and
-    return a structured JSON result: fit_score, matching_skills,
-    missing_skills, and suggested_tweaks.
-    """
-    client = OpenAI(api_key=openai_api_key)
-
-    system_instructions = (
-        "You are a helpful, precise career coach and technical recruiter. "
-        "You always respond with a single valid JSON object and nothing else - "
-        "no markdown fences, no commentary."
-    )
-
-    prompt = f"""
-Compare the RESUME below against the JOB DESCRIPTION below.
-
-Return ONLY a JSON object with exactly these keys:
-- "fit_score": an integer from 1 to 10 (10 = excellent fit)
-- "matching_skills": a list of up to 8 short strings — skills/experience from the resume that align with the job
-- "missing_skills": a list of up to 6 short strings — skills/requirements in the job description not evidenced in the resume
-- "suggested_tweaks": a list of 3-5 short, concrete, actionable suggestions for tailoring this resume to this specific job (e.g. "Add a bullet quantifying your SQL reporting work under the Analyst role")
-
-RESUME:
-{resume_text}
-
-JOB DESCRIPTION:
-{job_description}
-"""
-
-    response = client.responses.create(
-        model="gpt-4o",
-        instructions=system_instructions,
-        input=prompt,
-    )
-
-    raw = response.output_text.strip()
-    # Defensive cleanup in case the model wraps the JSON in code fences anyway
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        if raw.lower().startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
-
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        parsed = {
+    def _fallback(tweak: str) -> dict:
+        """Show an error and return an empty, same-shaped result."""
+        st.error(tweak)
+        return {
             "fit_score": None,
             "matching_skills": [],
             "missing_skills": [],
-            "suggested_tweaks": [f"Could not parse model response: {raw[:200]}"],
+            "suggested_tweaks": [tweak],
+            "job_title": job_title,
         }
+
+    payload = {
+        "resume_text": resume_text,
+        "jobs": [{"title": job_title, "description": job_description}],
+    }
+
+    try:
+        response = requests.post(
+            f"{BACKEND_URL}/analyze-fit",
+            json=payload,
+            headers={"X-OpenAI-Key": openai_api_key or ""},
+            timeout=120,
+        )
+    except requests.exceptions.RequestException as err:
+        return _fallback(f"Could not reach backend at {BACKEND_URL}: {err}")
+
+    if response.status_code != 200:
+        return _fallback(
+            f"Backend returned {response.status_code}: {response.text[:300]}"
+        )
+
+    try:
+        results = response.json().get("results", [])
+        parsed = dict(results[0])
+    except (json.JSONDecodeError, ValueError, IndexError, TypeError):
+        return _fallback(
+            f"Could not parse backend response: {response.text[:200]}"
+        )
 
     parsed["job_title"] = job_title
     return parsed
 
 
 def rewrite_bullet(bullet_text: str, job_title: str, job_description: str) -> dict:
+    """Rewrite a single resume bullet via the backend.
+
+    Posts to ``POST /rewrite-bullet`` so the bullet better targets a
+    specific job. On connection or HTTP errors, surfaces the problem via
+    ``st.error`` and returns a same-shaped fallback dict.
+
+    Args:
+        bullet_text: The single resume bullet point to rewrite.
+        job_title: Label for the target job.
+        job_description: The target job description.
+
+    Returns:
+        A dict with ``rewrites`` (a list of ``{"rewrite", "note"}`` objects)
+        and ``job_title``.
     """
-    Ask the LLM to rewrite a single resume bullet point so it's more
-    relevant to a specific job. Returns a structured JSON result: a list of
-    1-2 rewrites, each with a short note on what changed and why.
-    """
-    client = OpenAI(api_key=openai_api_key)
+    def _fallback(note: str) -> dict:
+        """Show an error and return the original bullet as a fallback."""
+        st.error(note)
+        return {
+            "rewrites": [{"rewrite": bullet_text, "note": note}],
+            "job_title": job_title,
+        }
 
-    system_instructions = (
-        "You are a helpful, precise career coach and technical recruiter. "
-        "You always respond with a single valid JSON object and nothing else - "
-        "no markdown fences, no commentary."
-    )
-
-    prompt = f"""
-Rewrite the RESUME BULLET below so it is more relevant and compelling for the JOB DESCRIPTION below.
-
-Return ONLY a JSON object with exactly this key:
-- "rewrites": a list of 1-2 objects, each with:
-    - "rewrite": a single rewritten version of the bullet — one line, led with a strong action verb, quantified where reasonable, and tailored to this job. Do not invent facts not implied by the original bullet.
-    - "note": a short one-line explanation of what changed and why it's a better fit for this specific job
-
-RESUME BULLET:
-{bullet_text}
-
-JOB DESCRIPTION:
-{job_description}
-"""
-
-    response = client.responses.create(
-        model="gpt-4o",
-        instructions=system_instructions,
-        input=prompt,
-    )
-
-    raw = response.output_text.strip()
-    # Defensive cleanup in case the model wraps the JSON in code fences anyway
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        if raw.lower().startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
+    payload = {
+        "bullet_text": bullet_text,
+        "job_title": job_title,
+        "job_description": job_description,
+    }
 
     try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        parsed = {
-            "rewrites": [
-                {"rewrite": raw[:300], "note": "Could not parse model response as JSON."}
-            ],
-        }
+        response = requests.post(
+            f"{BACKEND_URL}/rewrite-bullet",
+            json=payload,
+            headers={"X-OpenAI-Key": openai_api_key or ""},
+            timeout=120,
+        )
+    except requests.exceptions.RequestException as err:
+        return _fallback(f"Could not reach backend at {BACKEND_URL}: {err}")
+
+    if response.status_code != 200:
+        return _fallback(
+            f"Backend returned {response.status_code}: {response.text[:300]}"
+        )
+
+    try:
+        parsed = dict(response.json())
+        parsed.setdefault("rewrites", [])
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return _fallback(
+            f"Could not parse backend response: {response.text[:200]}"
+        )
 
     parsed["job_title"] = job_title
     return parsed
@@ -168,10 +184,18 @@ JOB DESCRIPTION:
 # Free helpers (no OpenAI calls — run entirely locally, no cost)
 # ---------------------------------------------------------------------------
 def compute_keyword_score(resume_text: str, job_text: str) -> float:
-    """
-    Rough, free fit estimate using TF-IDF cosine similarity between the
-    resume and job description. Not as nuanced as the AI analysis, but
-    costs nothing to run.
+    """Estimate resume/job fit locally via TF-IDF cosine similarity.
+
+    A rough, free alternative to the AI analysis — runs entirely on the
+    local machine with no OpenAI calls.
+
+    Args:
+        resume_text: The full resume text.
+        job_text: The job description text.
+
+    Returns:
+        A similarity score from 0.0 to 100.0 (percent), rounded to one
+        decimal place; 0.0 if either input is blank.
     """
     if not resume_text.strip() or not job_text.strip():
         return 0.0
@@ -182,7 +206,14 @@ def compute_keyword_score(resume_text: str, job_text: str) -> float:
 
 
 def generate_wordcloud_image(text: str):
-    """Generate a word cloud image (PIL Image) from job description text."""
+    """Generate a word cloud image from job description text.
+
+    Args:
+        text: The text to visualize (e.g. a job description).
+
+    Returns:
+        A PIL ``Image`` of the rendered word cloud.
+    """
     wc = WordCloud(
         width=900,
         height=400,
@@ -194,9 +225,18 @@ def generate_wordcloud_image(text: str):
 
 
 def run_ats_checklist(resume_text: str) -> list:
-    """
-    Simple rule-based checks for common ATS-friendliness and completeness
-    issues. Purely local — no API calls.
+    """Run rule-based ATS-friendliness checks on a resume.
+
+    Checks length, presence of an email and phone number, standard
+    sections, and bullet points. Purely local — no API calls.
+
+    Args:
+        resume_text: The full resume text.
+
+    Returns:
+        A list of ``(label, passed, detail)`` tuples, where ``label`` is
+        the check name, ``passed`` is a bool, and ``detail`` is a
+        human-readable explanation.
     """
     checks = []
 
@@ -313,7 +353,7 @@ tab_ai, tab_free, tab_rewrite = st.tabs([
 # --- Tab 1: AI-powered analysis --------------------------------------------
 with tab_ai:
     st.caption(
-        "Sends your resume and job description(s) to OpenAI's API. "
+        "Sends your resume and job description(s) to OpenAI's API via the backend service. "
         "Costs a small amount of your own OpenAI credit — typically a cent or two per job."
     )
 
@@ -452,8 +492,8 @@ with tab_free:
 with tab_rewrite:
     st.caption(
         "Rewrites a single resume bullet to better target a specific job. "
-        "Sends it to OpenAI's API — costs a small amount of your own OpenAI "
-        "credit, same as the AI-Powered Analysis tab."
+        "Sends it to OpenAI's API via the backend service — costs a small amount of your own "
+        "OpenAI credit, same as the AI-Powered Analysis tab."
     )
 
     bullet_text = st.text_area(
